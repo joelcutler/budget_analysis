@@ -1,129 +1,164 @@
-"""
-Script Name:    budget_analysis.py
-Author:         Joel Cutler
-Revision Date:  2025-08-17
-Description:    This script read from a csv and generates a budget analysis report.
-Version:        v1.1
-Patch Notes:
-"""
-
-import pandas as pd
+import csv
+import os
+import re
+from collections import defaultdict
 from difflib import get_close_matches
 
+#--------------------------------------------------------------------------------------------------
+def read_csv_dynamic(file_path):
+    """Read CSV into list of dicts."""
+    with open(file_path, newline="", encoding="utf-8-sig") as csvfile:
+        reader = csv.DictReader(csvfile)
+        return list(reader), reader.fieldnames
 
 #--------------------------------------------------------------------------------------------------
-def coerce_amts(df, col):
-    """
-    Coerce the amounts in a DataFrame column to numeric, handling errors by converting them to NaN.
-    """
-    df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df
+def find_column(headers, candidates):
+    """Find the first header that matches candidate keywords."""
+    for h in headers:
+        for c in candidates:
+            if c in h.lower():
+                return h
+    return None  # return None if not found
 
 #--------------------------------------------------------------------------------------------------
-def summarize_recurring(df, min_occurrences=1, fuzzy_cutoff=0.6):
+def normalize_description(desc):
     """
-    Summarize recurring charges:
-      - Only include negative amounts
-      - Each repeating description stays separate
-      - Minor variations of the same description can be grouped with fuzzy matching
+    Normalize descriptions to create grouping keywords:
+      - Uppercase
+      - Remove *codes that contain numbers
+      - Keep *codes that are only letters
+      - Remove other punctuation
+      - Collapse extra spaces
     """
+    desc = desc.upper()
+    desc = re.sub(r'\*\w*\d\w*', '', desc)  # Remove *codes with numbers
+    desc = re.sub(r'[^A-Z\s]', ' ', desc)   # Remove punctuation
+    desc = re.sub(r'\s+', ' ', desc).strip()
+    return desc
 
-    # Clean column names
-    df.columns = df.columns.str.strip().str.lower()
-
-    # Detect columns
-    desc_col = next(c for c in df.columns if "description" in c.lower())
-    amt_col = next(c for c in df.columns if "amount" in c.lower())
-
-    # Strip any whitespace and coerce amounts to numeric
-    df[amt_col] = df[amt_col].astype(str).str.strip()  # remove stray spaces
-    df[amt_col] = pd.to_numeric(df[amt_col], errors='coerce')  # convert to numeric
-
-    # Only include negative amounts (charges)
-    df = df[df[amt_col] <= 0]
-
-    if df.empty:
-        return pd.DataFrame(columns=["description", "count", "total", "avg_per_month"])
-
-    # Count descriptions to identify recurring ones
-    desc_counts = df[desc_col].value_counts()
-    recurring_descriptions = [desc for desc, cnt in desc_counts.items() if cnt >= min_occurrences]
-
-    summary = []
-
-    for desc in recurring_descriptions:
-        temp_df = df[df[desc_col] == desc]
-
-        grouped_amounts = temp_df[amt_col].tolist()
-        total = abs(sum(grouped_amounts))
-        count = len(grouped_amounts)
-        avg_per_month = abs(round(total / 12, 2))
-
-        summary.append({
-            "description": desc,
-            "count": count,
-            "total": total,
-            "avg_per_month": avg_per_month
-        })
-
-    summary_df = pd.DataFrame(summary)
-
-    if not summary_df.empty:
-        summary_df = summary_df.sort_values(by='total', ascending=False).reset_index(drop=True)
-
-    return summary_df
-
-
-#!-------------------------------------------------------------------------------------------------
-def main(accounts):
+#--------------------------------------------------------------------------------------------------
+def group_similar_descriptions(grouped, cutoff=0.85):
     """
-    Process all accounts and generate recurring charges summaries,
-    automatically fixing column types if needed.
+    Merge similar normalized descriptions using fuzzy matching.
     """
+    merged = {}
+    for desc, stats in grouped.items():
+        match = get_close_matches(desc, merged.keys(), n=1, cutoff=cutoff)
+        if match:
+            key = match[0]
+            merged[key]["count"] += stats["count"]
+            merged[key]["total"] += stats["total"]
+            # Merge categories: keep first non-empty or "N/A"
+            if merged[key]["category"] == "N/A" and stats["category"] != "N/A":
+                merged[key]["category"] = stats["category"]
+        else:
+            merged[desc] = stats.copy()
+    return merged
 
-    for account in accounts:
-        df = account['df']
-        name = account['name']
+#--------------------------------------------------------------------------------------------------
+def write_csv(output_file, grouped):
+    """Write grouped summary to CSV."""
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Description", "Category", "Count", "Total", "Monthly Average"])
+        for desc, stats in sorted(grouped.items(), key=lambda x: x[0]):
+            if stats["count"] <= 1:
+                continue
+            avg_month = stats["total"] / 12
+            writer.writerow([
+                desc,
+                stats["category"],
+                stats["count"],
+                f"${stats['total']:.2f}",
+                f"${avg_month:.2f}"
+            ])
+    print(f"✅ Wrote {output_file}")
 
-        # Clean column names
-        df.columns = df.columns.str.strip().str.lower()
+#--------------------------------------------------------------------------------------------------
+def process_account(account, path):
+    transactions, headers = read_csv_dynamic(path)
+    desc_col = find_column(headers, ["desc"])
+    amt_col = find_column(headers, ["amount", "amt"])
+    cat_col = find_column(headers, ["category", "cat"]) or "N/A"
 
-        # Detect columns
-        desc_col = next(c for c in df.columns if "description" in c.lower())
-        amt_col = next(c for c in df.columns if "amount" in c.lower())
+    grouped = defaultdict(lambda: {"count": 0, "total": 0.00, "category": "N/A"})
 
-        # Force correct types
-        df[desc_col] = df[desc_col].astype(str).str.strip()
-        df[amt_col] = pd.to_numeric(df[amt_col], errors='coerce')
+    for row in transactions:
+        desc_raw = row[desc_col].strip()
+        try:
+            amt = float(row[amt_col].replace(",", "").replace("$", ""))
+        except:
+            continue
+        if amt >= 0:
+            continue
+        amt = abs(amt)
 
-        # Drop rows with empty or invalid descriptions
-        df = df[df[desc_col].notna() & (df[desc_col] != 'nan')]
+        # Determine category if available
+        category = row[cat_col].strip() if cat_col != "N/A" and row.get(cat_col) else "N/A"
 
-        # Generate recurring charges summary
-        summary_df = summarize_recurring(df, min_occurrences=2)
+        keyword = normalize_description(desc_raw)
+        g = grouped[keyword]
+        g["count"] += 1
+        g["total"] += amt
+        if g["category"] == "N/A":
+            g["category"] = category
 
-        # Print the summary
-        print(f"\nRecurring charges summary for {name}:\n")
-        print(summary_df)
+    merged = group_similar_descriptions(grouped)
+    output_file = f"./output/{account}_summary.csv"
+    write_csv(output_file, merged)
 
-        # Save to CSV
-        summary_df.to_csv(f"./output/{name}_recurring_summary.csv", index=False)
+    # Return rows for combined CSV
+    rows = []
+    for desc, stats in merged.items():
+        if stats["count"] <= 1:
+            continue
+        avg_month = stats["total"] / 12
+        rows.append([desc, stats["category"], stats["count"], stats["total"], avg_month])
+    return rows
 
+#--------------------------------------------------------------------------------------------------
+def merge_rows(rows, cutoff=0.85):
+    """Merge combined rows using fuzzy matching to avoid duplicates across accounts."""
+    grouped = {}
+    for desc, category, count, total, avg in rows:
+        if desc not in grouped:
+            grouped[desc] = {"count": count, "total": total, "category": category}
+        else:
+            grouped[desc]["count"] += count
+            grouped[desc]["total"] += total
+            if grouped[desc]["category"] == "N/A" and category != "N/A":
+                grouped[desc]["category"] = category
 
-#?-------------------------------------------------------------------------------------------------
+    return group_similar_descriptions(grouped, cutoff=cutoff)
+
+#--------------------------------------------------------------------------------------------------
+def main(files):
+    all_rows = []
+
+    for account, path in files.items():
+        if not os.path.exists(path):
+            print(f"[WARN] {path} not found, skipping.")
+            continue
+        account_rows = process_account(account, path)
+        all_rows.extend(account_rows)
+
+    # Merge duplicates across accounts
+    merged_all = merge_rows(all_rows)
+
+    # Sort by description
+    sorted_all = dict(sorted(merged_all.items(), key=lambda x: x[0]))
+
+    # Write combined CSV
+    combined_file = "./output/all_accounts_summary.csv"
+    write_csv(combined_file, sorted_all)
+
+#--------------------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Load CSVs
-    card_8296_df = pd.read_csv('./input/Chase8296_Activity20240801_20250817_20250817.csv')
-    card_2835_df = pd.read_csv('./input/Chase2835_Activity20240801_20250817_20250817.csv')
-    # checking_df = pd.read_csv('./input/Chase8967_Activity_20250817.csv')
-    # print(checking_df.head())
-    # print(checking_df.dtypes)
+    files = {
+        "Chase8296": "./input/Chase8296_Activity20240801_20250817_20250817.csv",
+        "Chase2835": "./input/Chase2835_Activity20240801_20250817_20250817.csv",
+        "Chase8967": "./input/Chase8967_Activity_20250817.csv"
+    }
 
-    # List of account dicts
-    accounts = [
-        {"df": card_8296_df, "name": "Card_8296"},
-        {"df": card_2835_df, "name": "Card_2835"},
-        # {"df": checking_df, "name": "Checking"}
-    ]
-
-    main(accounts)
+    main(files)
